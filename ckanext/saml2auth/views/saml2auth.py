@@ -30,8 +30,7 @@ import ckan.model as model
 import ckan.plugins as plugins
 import ckan.lib.dictization.model_dictize as model_dictize
 from ckan.lib import base
-from ckan.views.user import set_repoze_user
-from ckan.common import config, g, request
+from ckan.common import config, g
 
 from ckanext.saml2auth.spconfig import get_config as sp_config
 from ckanext.saml2auth import helpers as h
@@ -42,13 +41,42 @@ from ckanext.saml2auth.cache import set_subject_id, set_saml_session_info
 log = logging.getLogger(__name__)
 saml2auth = Blueprint(u'saml2auth', __name__)
 
+# Paths that should never be used as post-login redirect targets
+# because they are login/register pages themselves
+EXCLUDED_RELAY_PATHS = ['/user/login', '/user/register', '/user/_logout']
+EXCLUDED_RELAY_ENDPOINTS = ['user.login', 'user.register']
+
+
+def _is_excluded_relay_state(relay_state):
+    """Check if relay_state points to a login/register page we should not
+    redirect to."""
+    if not relay_state:
+        return True
+
+    # Check exact endpoint name matches
+    if relay_state in EXCLUDED_RELAY_ENDPOINTS:
+        return True
+
+    # Check path-only matches (e.g. /user/login)
+    if relay_state in EXCLUDED_RELAY_PATHS:
+        return True
+
+    # Check full URL matches — extract path and compare
+    try:
+        parsed = urlparse(relay_state)
+        if parsed.path in EXCLUDED_RELAY_PATHS:
+            return True
+    except Exception:
+        pass
+
+    return False
+
 
 def _get_requested_authn_contexts():
-    requested_authn_contexts = config.get('ckanext.saml2auth.requested_authn_context',
-                                          None)
+    requested_authn_contexts = config.get(
+        'ckanext.saml2auth.requested_authn_context', None)
     if requested_authn_contexts is None or requested_authn_contexts == '':
         return []
-
     return requested_authn_contexts.strip().split()
 
 
@@ -58,39 +86,30 @@ def _dictize_user(user_obj):
         u'model': model,
     }
     user_dict = model_dictize.user_dictize(user_obj, context)
-    # Make sure plugin_extras are included or plugins might drop the saml_id one
     # Make a copy so SQLAlchemy can track changes properly
     user_dict['plugin_extras'] = copy.deepcopy(user_obj.plugin_extras)
-
     return user_dict
 
 
 def _get_user_by_saml_id(saml_id):
     user_obj = model.Session.query(model.User) \
-        .filter(model.User.plugin_extras[(u'saml2auth', u'saml_id')].astext == saml_id) \
+        .filter(model.User.plugin_extras[
+            (u'saml2auth', u'saml_id')].astext == saml_id) \
         .first()
-
     h.activate_user_if_deleted(user_obj)
-
     return _dictize_user(user_obj) if user_obj else None
 
 
 def _get_user_by_email(email):
-
     user = model.User.by_email(email)
     if user and isinstance(user, list):
         user = user[0]
-
     h.activate_user_if_deleted(user)
-
     return _dictize_user(user) if user else None
 
 
 def _update_user(user_dict):
-    context = {
-        u'ignore_auth': True,
-    }
-
+    context = {u'ignore_auth': True}
     try:
         return toolkit.get_action(u'user_update')(context, user_dict)
     except toolkit.ValidationError as e:
@@ -99,10 +118,7 @@ def _update_user(user_dict):
 
 
 def _create_user(user_dict):
-    context = {
-        u'ignore_auth': True,
-    }
-
+    context = {u'ignore_auth': True}
     try:
         return toolkit.get_action(u'user_create')(context, user_dict)
     except toolkit.ValidationError as e:
@@ -112,23 +128,12 @@ def _create_user(user_dict):
 
 def process_user(email, saml_id, full_name, saml_attributes):
     u'''
-    Check if a CKAN-SAML user exists for the current SAML login, if not create
-    a new one
-
-    Here are the checks performed in order:
-
-    1. Is there an existing user that matches the provided saml_id (in plugin_extras)?
-    2. Is there an existing user that matches the provided email?
-    3. If no CKAN user found, create a new one with the provided saml id
-
-    Returns the user name
+    Check if a CKAN-SAML user exists for the current SAML login, if not
+    create a new one. Returns the user name.
     '''
-
     user_dict = _get_user_by_saml_id(saml_id)
 
-    # First we check if there is a SAML-CKAN user
     if user_dict:
-
         current_user_dict = copy.deepcopy(user_dict)
 
         if email != user_dict['email'] or full_name != user_dict['fullname']:
@@ -138,41 +143,24 @@ def process_user(email, saml_id, full_name, saml_attributes):
         for plugin in plugins.PluginImplementations(ISaml2Auth):
             plugin.before_saml2_user_update(user_dict, saml_attributes)
 
-        # Update the existing CKAN-SAML user only if the SAML user name or
-        # email are changed in the IdP, or if another plugin modified the
-        # user dict
         if current_user_dict != user_dict:
-
             user_dict = _update_user(user_dict)
 
         return user_dict['name']
-
-    # If there is no SAML user but there is a regular CKAN
-    # user with the same email as the current login,
-    # make that user a SAML-CKAN user and change
-    # its password so the user can use only SSO
 
     user_dict = _get_user_by_email(email)
 
     if user_dict:
         user_dict[u'password'] = h.generate_password()
         user_dict[u'plugin_extras'] = {
-            u'saml2auth': {
-                # Store the saml username
-                # in the corresponding CKAN user
-                u'saml_id': saml_id
-            }
+            u'saml2auth': {u'saml_id': saml_id}
         }
 
         for plugin in plugins.PluginImplementations(ISaml2Auth):
             plugin.before_saml2_user_update(user_dict, saml_attributes)
 
         user_dict = _update_user(user_dict)
-
         return user_dict['name']
-
-    # This is the first time this SAML user has logged in, let's create a CKAN user
-    # for them
 
     user_dict = {
         u'name': h.ensure_unique_username_from_email(email),
@@ -180,11 +168,7 @@ def process_user(email, saml_id, full_name, saml_attributes):
         u'email': email,
         u'password': h.generate_password(),
         u'plugin_extras': {
-            u'saml2auth': {
-                # Store the saml username
-                # in the corresponding CKAN user
-                u'saml_id': saml_id
-            }
+            u'saml2auth': {u'saml_id': saml_id}
         }
     }
 
@@ -202,14 +186,10 @@ def acs():
     g.user = None
     g.userobj = None
 
-    saml_user_firstname = \
-        config.get(u'ckanext.saml2auth.user_firstname')
-    saml_user_lastname = \
-        config.get(u'ckanext.saml2auth.user_lastname')
-    saml_user_fullname = \
-        config.get(u'ckanext.saml2auth.user_fullname')
-    saml_user_email = \
-        config.get(u'ckanext.saml2auth.user_email')
+    saml_user_firstname = config.get(u'ckanext.saml2auth.user_firstname')
+    saml_user_lastname = config.get(u'ckanext.saml2auth.user_lastname')
+    saml_user_fullname = config.get(u'ckanext.saml2auth.user_fullname')
+    saml_user_email = config.get(u'ckanext.saml2auth.user_email')
 
     client = h.saml_client(sp_config())
     saml_response = request.form.get(u'SAMLResponse', None)
@@ -234,37 +214,76 @@ def acs():
     user_info = auth_response.get_subject()
     session_info = auth_response.session_info()
 
-    # SAML username - unique
     saml_id = user_info.text
-    # Required user attributes for user creation
     email = auth_response.ava[saml_user_email][0]
 
     if saml_user_firstname and saml_user_lastname:
-        first_name = auth_response.ava.get(saml_user_firstname, [email.split('@')[0]])[0]
-        last_name = auth_response.ava.get(saml_user_lastname, [email.split('@')[1]])[0]
+        first_name = auth_response.ava.get(
+            saml_user_firstname, [email.split('@')[0]])[0]
+        last_name = auth_response.ava.get(
+            saml_user_lastname, [email.split('@')[1]])[0]
         full_name = u'{} {}'.format(first_name, last_name)
     else:
-        if saml_user_fullname in auth_response.ava:
+        if saml_user_fullname and saml_user_fullname in auth_response.ava:
             full_name = auth_response.ava[saml_user_fullname][0]
         else:
-            full_name = u'{} {}'.format(email.split('@')[0], email.split('@')[1])
+            full_name = u'{} {}'.format(
+                email.split('@')[0], email.split('@')[1])
 
     g.user = process_user(email, saml_id, full_name, auth_response.ava)
+    log.debug("SAML2 acs: process_user returned username: %s", g.user)
 
-    # Check if the authenticated user email is in given list of emails
-    # and make that user sysadmin and opposite
     h.update_user_sysadmin_status(g.user, email)
 
+    # Flush so newly created users are visible to the by_name query
+    model.Session.flush()
     g.userobj = model.User.by_name(g.user)
+    log.debug("SAML2 acs: g.userobj resolved to: %s", g.userobj)
 
-    relay_state = request.form.get('RelayState')
-    redirect_target = toolkit.url_for(
-        relay_state, _external=True) if relay_state else config.get(
-            'ckanext.saml2auth.default_fallback_endpoint', 'user.me')
+    if g.userobj is None:
+        log.error("SAML2 acs: could not find user object for: %s", g.user)
+        extra_vars = {
+            u'code': [500],
+            u'content': 'User login failed - user not found'
+        }
+        return base.render(u'error_document_template.html', extra_vars), 500
 
+    # Determine redirect target — return the user to where they started
+    relay_state = request.form.get('RelayState', '')
+    log.debug("SAML2 acs: relay_state received: %s", relay_state)
+
+    default_endpoint = config.get(
+        'ckanext.saml2auth.default_fallback_endpoint', 'user.me')
+
+    if _is_excluded_relay_state(relay_state):
+        # No usable came-from, or it points at a login/register page
+        redirect_target = toolkit.url_for(default_endpoint, _external=True)
+        log.debug("SAML2 acs: relay_state excluded, using default: %s",
+                  redirect_target)
+    else:
+        parsed = urlparse(relay_state)
+        if parsed.scheme and parsed.netloc:
+            # Full absolute URL (e.g. http://localhost:5000/dataset/foo)
+            redirect_target = relay_state
+        elif parsed.path and parsed.path != '/':
+            # A path relative to the site (e.g. /dataset/foo)
+            redirect_target = relay_state
+        else:
+            # Possibly an endpoint name (e.g. 'dataset.read')
+            try:
+                redirect_target = toolkit.url_for(relay_state, _external=True)
+            except Exception:
+                redirect_target = toolkit.url_for(
+                    default_endpoint, _external=True)
+
+    log.debug("SAML2 acs: final redirect_target: %s", redirect_target)
     resp = toolkit.redirect_to(redirect_target)
 
     _log_user_into_ckan(resp)
+
+    # Force session save — without this Flask-Session may not
+    # write the cookie on redirect responses
+    session.modified = True
 
     set_saml_session_info(session, session_info)
     set_subject_id(session, session_info['name_id'])
@@ -276,53 +295,60 @@ def acs():
 
 
 def _log_user_into_ckan(resp):
-    """ Log the user into different CKAN versions.
+    """Log the user into CKAN (2.10+ uses flask-login's login_user)."""
+    from ckan.common import login_user
 
-    CKAN 2.10 introduces flask-login and login_user method.
+    log.debug(
+        "SAML2 _log_user_into_ckan: calling login_user with: %s",
+        g.userobj
+    )
 
-    CKAN 2.9.6 added a security change and identifies the user
-    with the internal id plus a serial autoincrement (currently static).
+    login_user(g.userobj)
 
-    CKAN <= 2.9.5 identifies the user only using the internal id.
-    """
-    if toolkit.check_ckan_version(min_version="2.10"):
-        from ckan.common import login_user
-        login_user(g.userobj)
-        return
+    log.info(
+        u'User {0}<{1}> logged in successfully'.format(
+            g.userobj.name,
+            g.userobj.email
+        )
+    )
 
-    if toolkit.check_ckan_version(min_version="2.9.6"):
-        user_id = "{},1".format(g.userobj.id)
-    else:
-        user_id = g.userobj.name
-    set_repoze_user(user_id, resp)
+    return
 
 
 def saml2login():
-    u'''Redirects the user to the
-     configured identity provider for authentication
+    u'''Redirects the user to the configured identity provider for
+    authentication.
     '''
     client = h.saml_client(sp_config())
     requested_authn_contexts = _get_requested_authn_contexts()
+    
     relay_state = toolkit.request.args.get('came_from', '')
-   
+    log.debug("SAML2 saml2login: came_from arg: %s", relay_state)
     if relay_state == '' and request and request.referrer:
         relay_state = urlparse(request.referrer).path
+    log.debug("SAML2 saml2login: relay_state to send to IdP: %s", relay_state)
+
+    # Never send login/register as relay_state to the IdP
+    if _is_excluded_relay_state(relay_state):
+        relay_state = ''
 
     if len(requested_authn_contexts) > 0:
-        comparison = config.get('ckanext.saml2auth.requested_authn_context_comparison',
-                                'minimum')
+        comparison = config.get(
+            'ckanext.saml2auth.requested_authn_context_comparison', 'minimum')
         if comparison not in ['exact', 'minimum', 'maximum', 'better']:
-            error = 'Unexpected comparison value {}'.format(comparison)
-            raise ValueError(error)
+            raise ValueError(
+                'Unexpected comparison value {}'.format(comparison))
 
         final_context = requested_authn_context(
             class_ref=requested_authn_contexts,
             comparison=comparison
         )
-
-        reqid, info = client.prepare_for_authenticate(requested_authn_context=final_context, relay_state=relay_state)
+        reqid, info = client.prepare_for_authenticate(
+            requested_authn_context=final_context,
+            relay_state=relay_state)
     else:
-        reqid, info = client.prepare_for_authenticate(relay_state=relay_state)
+        reqid, info = client.prepare_for_authenticate(
+            relay_state=relay_state)
 
     redirect_url = None
     for key, value in info[u'headers']:
@@ -332,19 +358,21 @@ def saml2login():
 
 
 def disable_default_login_register():
-    u'''View function used to
-    override and disable default Register/Login routes
+    u'''View function used to override and disable default Register/Login
+    routes.
     '''
-    extra_vars = {u'code': [403], u'content': u'This resource is forbidden '
-                                              u'by the system administrator. '
-                                              u'Only SSO through SAML2 authorization'
-                                              u' is available at this moment.'}
+    extra_vars = {
+        u'code': [403],
+        u'content': (u'This resource is forbidden by the system administrator.'
+                     u' Only SSO through SAML2 authorization is available at'
+                     u' this moment.')
+    }
     return base.render(u'error_document_template.html', extra_vars), 403
 
 
 def slo():
-    u'''View function that handles the IDP logout
-    request response and finish with logging out the user from CKAN
+    u'''View function that handles the IDP logout request response and
+    finishes by logging out the user from CKAN.
     '''
     return toolkit.redirect_to(u'user.logout')
 
