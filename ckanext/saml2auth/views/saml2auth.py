@@ -20,7 +20,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import logging
 import copy
 
-from flask import Blueprint, session, request
+from flask import Blueprint, session, request, make_response
 from urllib.parse import urlparse
 from saml2 import entity
 from saml2.authn_context import requested_authn_context
@@ -78,6 +78,31 @@ def _get_requested_authn_contexts():
     if requested_authn_contexts is None or requested_authn_contexts == '':
         return []
     return requested_authn_contexts.strip().split()
+
+
+SSO_BINDINGS = {
+    u'post': entity.BINDING_HTTP_POST,
+    u'redirect': entity.BINDING_HTTP_REDIRECT,
+    entity.BINDING_HTTP_POST.lower(): entity.BINDING_HTTP_POST,
+    entity.BINDING_HTTP_REDIRECT.lower(): entity.BINDING_HTTP_REDIRECT,
+}
+
+
+def _get_sso_binding():
+    u'''Return the binding used to send the AuthnRequest to the IdP.
+
+    HTTP-POST is the default: the browser gets an HTML form that posts the
+    request to the IdP, so there is no Location header for a reverse proxy
+    to rewrite. HTTP-Redirect sends the request as a 302 with the request
+    in the query string.
+    '''
+    value = config.get(u'ckanext.saml2auth.sso_binding') or u'post'
+    binding = SSO_BINDINGS.get(value.strip().lower())
+    if binding is None:
+        raise ValueError(
+            u'Unexpected ckanext.saml2auth.sso_binding value {}, use '
+            u'post or redirect'.format(value))
+    return binding
 
 
 def _dictize_user(user_obj):
@@ -316,12 +341,14 @@ def _log_user_into_ckan(resp):
 
 
 def saml2login():
-    u'''Redirects the user to the configured identity provider for
-    authentication.
+    u'''Sends the user to the configured identity provider for
+    authentication, with an auto-submitting form (HTTP-POST, the default)
+    or a redirect (HTTP-Redirect), see ckanext.saml2auth.sso_binding.
     '''
     client = h.saml_client(sp_config())
     requested_authn_contexts = _get_requested_authn_contexts()
-    
+    binding = _get_sso_binding()
+
     relay_state = toolkit.request.args.get('came_from', '')
     log.debug("SAML2 saml2login: came_from arg: %s", relay_state)
     if relay_state == '' and request and request.referrer:
@@ -345,10 +372,19 @@ def saml2login():
         )
         reqid, info = client.prepare_for_authenticate(
             requested_authn_context=final_context,
-            relay_state=relay_state)
+            relay_state=relay_state,
+            binding=binding)
     else:
         reqid, info = client.prepare_for_authenticate(
-            relay_state=relay_state)
+            relay_state=relay_state,
+            binding=binding)
+
+    if binding == entity.BINDING_HTTP_POST:
+        # An HTML page whose form posts the AuthnRequest to the IdP
+        response = make_response(info[u'data'], 200)
+        response.headers[u'Content-Type'] = u'text/html; charset=utf-8'
+        response.headers[u'Cache-Control'] = u'no-cache, no-store'
+        return response
 
     redirect_url = None
     for key, value in info[u'headers']:

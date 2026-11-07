@@ -51,6 +51,7 @@ class TestBlueprint(object):
                u'Only SSO through SAML2 authorization ' \
                u'is available at this moment.' in response
 
+    @pytest.mark.ckan_config(u'ckanext.saml2auth.sso_binding', u'redirect')
     @pytest.mark.ckan_config(u'ckanext.saml2auth.idp_metadata.location', u'local')
     @pytest.mark.ckan_config(u'ckanext.saml2auth.idp_metadata.local_path',
                              os.path.join(extras_folder, 'provider2', 'idp.xml'))
@@ -59,7 +60,36 @@ class TestBlueprint(object):
         url = url_for('saml2auth.saml2login', came_from='/dataset/my-dataset')
 
         response = app.get(url=url, follow_redirects=False)
+        assert response.status_code == 302
+        assert response.headers['Location'].startswith('https://idp.organization.com/auth?')
         assert 'RelayState=%2Fdataset%2Fmy-dataset' in response.headers['Location']
+
+    @pytest.mark.ckan_config(u'ckanext.saml2auth.idp_metadata.location', u'local')
+    @pytest.mark.ckan_config(u'ckanext.saml2auth.idp_metadata.local_path',
+                             os.path.join(extras_folder, 'provider2', 'idp.xml'))
+    def test_authn_request_posted_by_default(self, app):
+
+        url = url_for('saml2auth.saml2login', came_from='/dataset/my-dataset')
+
+        response = app.get(url=url, follow_redirects=False)
+        assert response.status_code == 200
+        assert 'Location' not in response.headers
+        assert response.headers['Content-Type'].startswith('text/html')
+        body = response.get_data(as_text=True)
+        assert '<form action="https://idp.organization.com/auth" method="post">' in body
+        assert 'name="SAMLRequest"' in body
+        assert 'name="RelayState" value="/dataset/my-dataset"' in body
+
+    @pytest.mark.ckan_config(u'ckanext.saml2auth.sso_binding', u'bad_value')
+    @pytest.mark.ckan_config(u'ckanext.saml2auth.idp_metadata.location', u'local')
+    @pytest.mark.ckan_config(u'ckanext.saml2auth.idp_metadata.local_path',
+                             os.path.join(extras_folder, 'provider2', 'idp.xml'))
+    @pytest.mark.usefixtures(u'with_request_context')
+    def test_bad_sso_binding(self):
+        from ckanext.saml2auth.views.saml2auth import saml2login
+        with pytest.raises(ValueError) as e:
+            saml2login()
+        assert 'sso_binding' in str(e.value)
 
     @pytest.mark.ckan_config(u'ckanext.saml2auth.idp_metadata.location', u'local')
     @pytest.mark.ckan_config(u'ckanext.saml2auth.idp_metadata.local_path',

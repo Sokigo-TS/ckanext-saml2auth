@@ -129,6 +129,15 @@ Optional:
     # Comparison could be one of this: exact, minimum, maximum or better
     ckanext.saml2auth.requested_authn_context_comparison = exact
 
+    # Binding used to send the login request (AuthnRequest) to the IdP
+    # post: an HTML page with a form that posts the request to the IdP. There is
+    #       no Location header, so a reverse proxy (e.g. IIS ARR) cannot rewrite it.
+    # redirect: a 302 redirect with the request in the query string (HTTP GET).
+    # The full binding URNs are accepted too. The IdP metadata must list a
+    # SingleSignOnService for the chosen binding.
+    # Default: post
+    ckanext.saml2auth.sso_binding = redirect
+
     # Indicates if this entity will sign the Logout Requests originated from it
     ckanext.saml2auth.logout_requests_signed = False
 
